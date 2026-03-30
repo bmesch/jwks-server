@@ -5,26 +5,21 @@ import (
 	"encoding/json"
 	"math/big"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// --------------------------
-// JWK struct for JWKS output
-// --------------------------
 type JWK struct {
-	Kty string `json:"kty"` // Key Type
-	Kid string `json:"kid"` // Key ID
-	Use string `json:"use"` // "sig"
-	Alg string `json:"alg"` // Algorithm
-	N   string `json:"n"`   // Modulus
-	E   string `json:"e"`   // Exponent
+	Kty string `json:"kty"`
+	Kid string `json:"kid"`
+	Use string `json:"use"`
+	Alg string `json:"alg"`
+	N   string `json:"n"`
+	E   string `json:"e"`
 }
 
-// --------------------------
-// Convert *Key to JWK
-// --------------------------
 func JWKFromKey(k *Key) JWK {
 	rsaKey := k.PublicKey
 	nBytes := rsaKey.N.Bytes()
@@ -32,7 +27,7 @@ func JWKFromKey(k *Key) JWK {
 
 	return JWK{
 		Kty: "RSA",
-		Kid: k.Kid,
+		Kid: strconv.Itoa(k.Kid),
 		Use: "sig",
 		Alg: "RS256",
 		N:   base64.RawURLEncoding.EncodeToString(nBytes),
@@ -40,14 +35,15 @@ func JWKFromKey(k *Key) JWK {
 	}
 }
 
-// --------------------------
-// JWKSHandler serves unexpired keys
-// --------------------------
 func JWKSHandler(w http.ResponseWriter, r *http.Request) {
-	// always initialize slice to avoid null in JSON
-	jwks := []JWK{}
+	keys, err := GetAllValidKeys()
+	if err != nil {
+		http.Error(w, "Failed to load keys", http.StatusInternalServerError)
+		return
+	}
 
-	for _, key := range GetUnexpiredKeys() {
+	jwks := []JWK{}
+	for _, key := range keys {
 		jwks = append(jwks, JWKFromKey(key))
 	}
 
@@ -57,54 +53,44 @@ func JWKSHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// --------------------------
-// AuthHandler issues JWTs
-// --------------------------
 func AuthHandler(w http.ResponseWriter, r *http.Request) {
-	expiredParam := r.URL.Query().Get("expired") == "true"
+	_, expiredPresent := r.URL.Query()["expired"]
 
 	var key *Key
-	if expiredParam {
-		expiredKeys := GetExpiredKeys()
-		if len(expiredKeys) == 0 {
-			http.Error(w, "No expired keys available", http.StatusInternalServerError)
-			return
-		}
-		key = expiredKeys[0] // pick first expired key
+	var err error
+	
+	if r.Method != http.MethodPost {
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	return
+	}	
+
+	if expiredPresent {
+		key, err = GetExpiredKey()
 	} else {
-		unexpiredKeys := GetUnexpiredKeys()
-		if len(unexpiredKeys) == 0 {
-			http.Error(w, "No unexpired keys available", http.StatusInternalServerError)
-			return
-		}
-		key = unexpiredKeys[0] // pick first unexpired key
+		key, err = GetValidKey()
 	}
 
-	// Create JWT token
+	if err != nil {
+		http.Error(w, "No suitable key available", http.StatusInternalServerError)
+		return
+	}
+
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
-		"sub": "user123",
+		"sub": "userABC",
 		"iat": time.Now().Unix(),
-		"exp": key.Expiry.Unix(),
+		"exp": time.Now().Add(15 * time.Minute).Unix(),
 	})
 
-	// Set kid in header
-	token.Header["kid"] = key.Kid
+	token.Header["kid"] = strconv.Itoa(key.Kid)
 
-	// Sign JWT
 	tokenString, err := token.SignedString(key.PrivateKey)
 	if err != nil {
 		http.Error(w, "Failed to sign token", http.StatusInternalServerError)
 		return
 	}
 
-	// Return as JSON
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"token": tokenString,
 	})
 }
-
-// --------------------------
-// Optional: helper to convert RSA key to JWK for single key
-// (already done via JWKFromKey)
-// --------------------------

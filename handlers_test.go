@@ -4,176 +4,285 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
+	"path/filepath"
+	"strconv"
 	"testing"
-	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// --------------------------
-// Helper: reset key store before each test
-// --------------------------
-func resetKeyStore() {
-	keyStore = map[string]*Key{}
+// setupTestDB creates a fresh temporary database and seeds it with one expired
+// key and one valid key.
+func setupTestDB(t *testing.T) {
+	t.Helper()
+
+	if db != nil {
+		_ = db.Close()
+		db = nil
+	}
+
+	dbPath = filepath.Join(t.TempDir(), "test_keys.db")
+
+	InitDB()
+
+	if err := SeedKeysIfEmpty(); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		if db != nil {
+			_ = db.Close()
+			db = nil
+		}
+	})
 }
 
-// --------------------------
-// Test JWKS endpoint with keys
-// --------------------------
+// setupEmptyTestDB creates a fresh temporary database without inserting keys.
+func setupEmptyTestDB(t *testing.T) {
+	t.Helper()
+
+	if db != nil {
+		_ = db.Close()
+		db = nil
+	}
+
+	dbPath = filepath.Join(t.TempDir(), "test_keys.db")
+
+	InitDB()
+
+	t.Cleanup(func() {
+		if db != nil {
+			_ = db.Close()
+			db = nil
+		}
+	})
+}
+
 func TestJWKSHandler(t *testing.T) {
-	resetKeyStore()
-	GenerateKey() // ensure at least one key exists
+	setupTestDB(t)
 
-	req := httptest.NewRequest("GET", "/.well-known/jwks.json", nil)
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/jwks.json", nil)
 	w := httptest.NewRecorder()
 
 	JWKSHandler(w, req)
 
 	if w.Code != http.StatusOK {
-		t.Errorf("Expected 200 OK, got %d", w.Code)
+		t.Fatalf("expected 200 OK, got %d", w.Code)
 	}
 
-	if !strings.Contains(w.Body.String(), "keys") {
-		t.Errorf("Expected 'keys' in response")
+	var resp map[string][]map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse JSON response: %v", err)
+	}
+
+	keys, ok := resp["keys"]
+	if !ok {
+		t.Fatal("expected 'keys' field in response")
+	}
+
+	if len(keys) == 0 {
+		t.Fatal("expected at least one valid key in JWKS")
+	}
+
+	firstKey := keys[0]
+	if firstKey["kty"] != "RSA" {
+		t.Errorf("expected kty RSA, got %v", firstKey["kty"])
+	}
+	if firstKey["alg"] != "RS256" {
+		t.Errorf("expected alg RS256, got %v", firstKey["alg"])
+	}
+	if firstKey["use"] != "sig" {
+		t.Errorf("expected use sig, got %v", firstKey["use"])
+	}
+	if firstKey["kid"] == "" {
+		t.Error("expected non-empty kid")
+	}
+	if firstKey["n"] == "" {
+		t.Error("expected non-empty n")
+	}
+	if firstKey["e"] == "" {
+		t.Error("expected non-empty e")
 	}
 }
 
-// --------------------------
-// Test JWKS endpoint with no keys
-// --------------------------
 func TestJWKSHandlerNoKeys(t *testing.T) {
-	resetKeyStore() // no keys
+	setupEmptyTestDB(t)
 
-	req := httptest.NewRequest("GET", "/.well-known/jwks.json", nil)
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/jwks.json", nil)
 	w := httptest.NewRecorder()
 
 	JWKSHandler(w, req)
 
 	if w.Code != http.StatusOK {
-		t.Errorf("Expected 200 OK, got %d", w.Code)
+		t.Fatalf("expected 200 OK, got %d", w.Code)
 	}
 
-	if !strings.Contains(w.Body.String(), `"keys":[]`) {
-		t.Errorf("Expected empty keys array, got %s", w.Body.String())
+	var resp map[string][]map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse JSON response: %v", err)
+	}
+
+	keys, ok := resp["keys"]
+	if !ok {
+		t.Fatal("expected 'keys' field in response")
+	}
+
+	if len(keys) != 0 {
+		t.Fatalf("expected empty keys array, got %d keys", len(keys))
 	}
 }
 
-// --------------------------
-// Test /auth with unexpired key
-// --------------------------
 func TestAuthHandlerUnexpired(t *testing.T) {
-	resetKeyStore()
-	key := GenerateKey() // unexpired key
+	setupTestDB(t)
 
-	req := httptest.NewRequest("POST", "/auth", nil)
+	expectedKey, err := GetValidKey()
+	if err != nil {
+		t.Fatalf("failed to get valid key: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/auth", nil)
 	w := httptest.NewRecorder()
 
 	AuthHandler(w, req)
 
 	if w.Code != http.StatusOK {
-		t.Errorf("Expected 200 OK, got %d", w.Code)
+		t.Fatalf("expected 200 OK, got %d", w.Code)
 	}
 
 	var resp map[string]string
-	json.Unmarshal(w.Body.Bytes(), &resp)
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse JSON response: %v", err)
+	}
 
 	tokenString := resp["token"]
 	if tokenString == "" {
-		t.Fatalf("Expected a token, got empty string")
+		t.Fatal("expected a token, got empty string")
 	}
 
 	token, _, err := jwt.NewParser().ParseUnverified(tokenString, jwt.MapClaims{})
 	if err != nil {
-		t.Fatalf("Failed to parse JWT: %v", err)
+		t.Fatalf("failed to parse JWT: %v", err)
 	}
 
-	if token.Header["kid"] != key.Kid {
-		t.Errorf("Expected kid %v, got %v", key.Kid, token.Header["kid"])
+	if token.Header["kid"] == nil {
+		t.Fatal("expected kid header in token")
 	}
 
-	claims := token.Claims.(jwt.MapClaims)
-	expClaim := int64(claims["exp"].(float64))
-	if expClaim != key.Expiry.Unix() {
-		t.Errorf("Expected exp %v, got %v", key.Expiry.Unix(), expClaim)
+	if token.Header["kid"] != strconv.Itoa(expectedKey.Kid) {
+		t.Errorf("expected kid %d, got %v", expectedKey.Kid, token.Header["kid"])
 	}
 }
 
-// --------------------------
-// Test /auth with expired key
-// --------------------------
 func TestAuthHandlerExpired(t *testing.T) {
-	resetKeyStore()
-	expiredKey := &Key{
-		PrivateKey: GenerateKey().PrivateKey,
-		PublicKey:  GenerateKey().PublicKey,
-		Kid:        "expired-test-key",
-		Expiry:     time.Now().Add(-time.Hour).Truncate(time.Second),
-	}
-	keyStore[expiredKey.Kid] = expiredKey
+	setupTestDB(t)
 
-	req := httptest.NewRequest("POST", "/auth?expired=true", nil)
+	expectedKey, err := GetExpiredKey()
+	if err != nil {
+		t.Fatalf("failed to get expired key: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/auth?expired=true", nil)
 	w := httptest.NewRecorder()
 
 	AuthHandler(w, req)
 
 	if w.Code != http.StatusOK {
-		t.Fatalf("Expected 200 OK, got %d", w.Code)
+		t.Fatalf("expected 200 OK, got %d", w.Code)
 	}
 
 	var resp map[string]string
-	json.Unmarshal(w.Body.Bytes(), &resp)
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse JSON response: %v", err)
+	}
 
 	tokenString := resp["token"]
 	if tokenString == "" {
-		t.Fatalf("Expected a token, got empty string")
+		t.Fatal("expected a token, got empty string")
 	}
 
 	token, _, err := jwt.NewParser().ParseUnverified(tokenString, jwt.MapClaims{})
 	if err != nil {
-		t.Fatalf("Failed to parse JWT: %v", err)
+		t.Fatalf("failed to parse JWT: %v", err)
 	}
 
-	if token.Header["kid"] != "expired-test-key" {
-		t.Errorf("Expected kid 'expired-test-key', got %v", token.Header["kid"])
+	if token.Header["kid"] == nil {
+		t.Fatal("expected kid header in token")
 	}
 
-	claims := token.Claims.(jwt.MapClaims)
-	expClaim := int64(claims["exp"].(float64))
-	if expClaim != expiredKey.Expiry.Unix() {
-		t.Errorf("Expected exp %v, got %v", expiredKey.Expiry.Unix(), expClaim)
+	if token.Header["kid"] != strconv.Itoa(expectedKey.Kid) {
+		t.Errorf("expected kid %d, got %v", expectedKey.Kid, token.Header["kid"])
 	}
 }
 
-// --------------------------
-// Test /auth with no unexpired keys
-// --------------------------
-func TestAuthHandlerNoUnexpiredKeys(t *testing.T) {
-	resetKeyStore() // no keys
+func TestAuthHandlerRejectsGet(t *testing.T) {
+	setupTestDB(t)
 
-	req := httptest.NewRequest("POST", "/auth", nil)
+	req := httptest.NewRequest(http.MethodGet, "/auth", nil)
 	w := httptest.NewRecorder()
 
 	AuthHandler(w, req)
 
-	if w.Code != http.StatusInternalServerError {
-		t.Errorf("Expected 500 Internal Server Error, got %d", w.Code)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 Method Not Allowed, got %d", w.Code)
 	}
 }
 
-// --------------------------
-// Test /auth?expired=true with no expired keys
-// --------------------------
-func TestAuthHandlerNoExpiredKeys(t *testing.T) {
-	resetKeyStore()
-	GenerateKey() // only unexpired key
+func TestAuthHandlerExpiredQueryPresenceOnly(t *testing.T) {
+	setupTestDB(t)
 
-	req := httptest.NewRequest("POST", "/auth?expired=true", nil)
+	req := httptest.NewRequest(http.MethodPost, "/auth?expired", nil)
 	w := httptest.NewRecorder()
 
 	AuthHandler(w, req)
 
-	if w.Code != http.StatusInternalServerError {
-		t.Errorf("Expected 500 Internal Server Error, got %d", w.Code)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", w.Code)
+	}
+
+	var resp map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse JSON response: %v", err)
+	}
+
+	if resp["token"] == "" {
+		t.Fatal("expected token in response")
+	}
+}
+func TestJWKSHandlerPostAlsoReturnsOK(t *testing.T) {
+	setupTestDB(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/.well-known/jwks.json", nil)
+	w := httptest.NewRecorder()
+
+	JWKSHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", w.Code)
+	}
+}
+
+func TestAuthHandlerTrailingSlash(t *testing.T) {
+	setupTestDB(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/", nil)
+	w := httptest.NewRecorder()
+
+	AuthHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", w.Code)
+	}
+}
+
+func TestAuthHandlerExpiredTrailingSlash(t *testing.T) {
+	setupTestDB(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/?expired=true", nil)
+	w := httptest.NewRecorder()
+
+	AuthHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", w.Code)
 	}
 }

@@ -1,34 +1,15 @@
-Brooke Mesch
+## Brooke Mesch
+## 11834510
+## CSCE 3550
+## Project 2 - Extending the JWKS Server
 
-11834510
+## Run
+go run .
 
-CSCE 3550.001
-
-Project 1: JWKS Server 
-
-
-
-JWKS Server - Go Implementation
-
-
-
-Run server:
-
-go run main.go keymanager.go handlers.go
-
-
-
-Endpoints:
-
-GET /.well-known/jwks.json
-
-POST /auth
-
-POST /auth?expired=true
-
-
-
-Run tests:
-
+## Test
 go test ./... -cover
 
+## Endpoints
+POST /auth
+POST /auth?expired=true
+GET /.well-known/jwks.json

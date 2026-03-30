@@ -1,74 +1,46 @@
 package main
 
 import (
-    "crypto/rand"
-    "crypto/rsa"
-    "log"
-    "time"
-
-    "github.com/google/uuid"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
+	"time"
 )
 
-// Key represents an RSA key pair with a unique ID and expiry
+
+// Key represents a key loaded from the DB
 type Key struct {
+    Kid         int
     PrivateKey *rsa.PrivateKey
     PublicKey  *rsa.PublicKey
-    Kid        string
     Expiry     time.Time
 }
 
-// Key store (in-memory)
-var keyStore = map[string]*Key{}
-
-// GenerateKey creates a new RSA key pair with kid and expiry
-func GenerateKey() *Key {
-    // Generate 2048-bit RSA private key
-    privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
-    if err != nil {
-        log.Fatal(err)
-    }
-    publicKey := &privateKey.PublicKey
-
-    // Assign a unique kid using UUID
-    kid := uuid.NewString()
-
-    // Set expiry to 1 hour from now
-    expiry := time.Now().Add(time.Hour)
-key := &Key{
-        PrivateKey: privateKey,
-        PublicKey:  publicKey,
-        Kid:        kid,
-        Expiry:     expiry,
-    }
-
-    // Store in memory
-    keyStore[kid] = key
-
-    return key
-}
-// GetUnexpiredKeys returns all keys that haven't expired
-func GetUnexpiredKeys() []*Key {
-    var keys []*Key
-    for _, k := range keyStore {
-        if k.Expiry.After(time.Now()) {
-            keys = append(keys, k)
-        }
-    }
-    return keys
+// GenerateRSAKey creates a new 2048-bit RSA private key
+func GenerateRSAKey() (*rsa.PrivateKey, error) {
+	return rsa.GenerateKey(rand.Reader, 2048)
 }
 
-// GetExpiredKeys returns all keys that have expired
-func GetExpiredKeys() []*Key {
-    var keys []*Key
-    for _, k := range keyStore {
-        if k.Expiry.Before(time.Now()) {
-            keys = append(keys, k)
-        }
-    }
-    return keys
+// PrivateKeyToPEM converts an RSA private key into PEM bytes for DB storage
+func PrivateKeyToPEM(priv *rsa.PrivateKey) ([]byte, error) {
+	der := x509.MarshalPKCS1PrivateKey(priv)
+
+	block := &pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: der,
+	}
+
+	return pem.EncodeToMemory(block), nil
 }
 
-// GetKeyByKid retrieves a key by its kid
-func GetKeyByKid(kid string) *Key {
-    return keyStore[kid]
+// PEMToPrivateKey converts PEM bytes back into an RSA private key
+func PEMToPrivateKey(pemBytes []byte) (*rsa.PrivateKey, error) {
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		return nil, errors.New("failed to decode PEM block")
+	}
+
+	return x509.ParsePKCS1PrivateKey(block.Bytes)
 }

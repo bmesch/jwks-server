@@ -1,25 +1,28 @@
 package main
 
 import (
-	"fmt"
-    "log"
-    "net/http"
+	"log"
+	"net/http"
+	"os"
 )
 
 func main() {
-    // Generate at least on key at startup
-	key := GenerateKey()
-    fmt.Println("Generated key with kid:", key.Kid)
-    fmt.Println("Expiry:", key.Expiry)
+	InitDB()
 
-	// Register JWKS endpoint
+	if err := SeedKeysIfEmpty(); err != nil {
+		log.Fatal(err)
+	}
+
 	http.HandleFunc("/.well-known/jwks.json", JWKSHandler)
-
-	// Register Auth endpoint
 	http.HandleFunc("/auth", AuthHandler)
+	http.HandleFunc("/auth/", AuthHandler)
 
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
 
-    log.Println("Server running on http://localhost:8080")
-    log.Fatal(http.ListenAndServe(":8080", nil))
+	addr := ":" + port
+	log.Printf("Server running on http://127.0.0.1:%s", port)
+	log.Fatal(http.ListenAndServe(addr, nil))
 }
-
