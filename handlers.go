@@ -20,6 +20,8 @@ type JWK struct {
 	E   string `json:"e"`
 }
 
+var authRequests = make(map[string][]time.Time)
+
 func JWKFromKey(k *Key) JWK {
 	rsaKey := k.PublicKey
 	nBytes := rsaKey.N.Bytes()
@@ -56,13 +58,38 @@ func JWKSHandler(w http.ResponseWriter, r *http.Request) {
 func AuthHandler(w http.ResponseWriter, r *http.Request) {
 	_, expiredPresent := r.URL.Query()["expired"]
 
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	requestIP := r.RemoteAddr
+	now := time.Now()
+
+	requests := authRequests[requestIP]
+	var recent []time.Time
+
+	for _, t := range requests {
+		if now.Sub(t) < time.Second {
+			recent = append(recent, t)
+		}
+	}
+
+	if len(recent) >= 10 {
+		http.Error(w, "Too many requests", http.StatusTooManyRequests)
+		return
+	}
+
+	authRequests[requestIP] = append(recent, now)
+
+	var authReq struct {
+		Username string `json:"username"`
+	}
+
+	_ = json.NewDecoder(r.Body).Decode(&authReq)
+
 	var key *Key
 	var err error
-	
-	if r.Method != http.MethodPost {
-	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	return
-	}	
 
 	if expiredPresent {
 		key, err = GetExpiredKey()
@@ -76,7 +103,7 @@ func AuthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
-		"sub": "userABC",
+		"sub": authReq.Username,
 		"iat": time.Now().Unix(),
 		"exp": time.Now().Add(15 * time.Minute).Unix(),
 	})
@@ -86,6 +113,19 @@ func AuthHandler(w http.ResponseWriter, r *http.Request) {
 	tokenString, err := token.SignedString(key.PrivateKey)
 	if err != nil {
 		http.Error(w, "Failed to sign token", http.StatusInternalServerError)
+		return
+	}
+
+	var userID *int
+	if authReq.Username != "" {
+		id, err := GetUserIDByUsername(authReq.Username)
+		if err == nil {
+			userID = &id
+		}
+	}
+
+	if err := LogAuthRequest(requestIP, userID); err != nil {
+		http.Error(w, "Failed to log auth request", http.StatusInternalServerError)
 		return
 	}
 

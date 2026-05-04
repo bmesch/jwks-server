@@ -3,14 +3,14 @@ package main
 import (
 	"crypto/rsa"
 	"database/sql"
-	_ "modernc.org/sqlite"
 	"log"
+	_ "modernc.org/sqlite"
 	"time"
 )
 
 // db is the global database connection used throughout the application.
 var db *sql.DB
-var dbPath = "totally_not_my_privateKeys.db"
+var dbPath = "./totally_not_my_privateKeys.db"
 
 // InitDB opens (or creates) the SQLite database file and ensures the required
 // keys table exists. This function must be called before any database operations.
@@ -24,14 +24,31 @@ func InitDB() {
 	}
 
 	// Create the keys table if it does not already exist
-	createTable := `
+	createTables := `
 	CREATE TABLE IF NOT EXISTS keys(
-		kid INTEGER PRIMARY KEY AUTOINCREMENT,
-		key BLOB NOT NULL,
-		exp INTEGER NOT NULL
+    kid INTEGER PRIMARY KEY AUTOINCREMENT,
+    key BLOB NOT NULL,
+    exp INTEGER NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS users(
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username TEXT NOT NULL UNIQUE,
+		password_hash TEXT NOT NULL,
+		email TEXT UNIQUE,
+		date_registered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		last_login TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS auth_logs(
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		request_ip TEXT NOT NULL,
+		request_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		user_id INTEGER,
+		FOREIGN KEY(user_id) REFERENCES users(id)
 	);`
 
-	_, err = db.Exec(createTable)
+	_, err = db.Exec(createTables)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -47,10 +64,14 @@ func InsertKey(priv *rsa.PrivateKey, exp int64) error {
 		return err
 	}
 
-	// Use parameterized query to safely insert key and expiration
+	encryptedKey, err := Encrypt(pemBytes)
+	if err != nil {
+		return err
+	}
+
 	_, err = db.Exec(
 		"INSERT INTO keys(key, exp) VALUES(?, ?)",
-		pemBytes,
+		encryptedKey,
 		exp,
 	)
 	return err
@@ -114,15 +135,19 @@ func GetValidKey() (*Key, error) {
 	`, now)
 
 	var kid int
-	var pemBytes []byte
+	var encryptedBytes []byte
 	var exp int64
 
-	err := row.Scan(&kid, &pemBytes, &exp)
+	err := row.Scan(&kid, &encryptedBytes, &exp)
 	if err != nil {
 		return nil, err
 	}
 
-	// Convert stored PEM back into RSA private key
+	pemBytes, err := Decrypt(encryptedBytes)
+	if err != nil {
+		return nil, err
+	}
+
 	priv, err := PEMToPrivateKey(pemBytes)
 	if err != nil {
 		return nil, err
@@ -136,8 +161,6 @@ func GetValidKey() (*Key, error) {
 	}, nil
 }
 
-// GetExpiredKey retrieves a single expired key from the database.
-// It returns the most recently expired key.
 func GetExpiredKey() (*Key, error) {
 	now := time.Now().Unix()
 
@@ -150,15 +173,19 @@ func GetExpiredKey() (*Key, error) {
 	`, now)
 
 	var kid int
-	var pemBytes []byte
+	var encryptedBytes []byte
 	var exp int64
 
-	err := row.Scan(&kid, &pemBytes, &exp)
+	err := row.Scan(&kid, &encryptedBytes, &exp)
 	if err != nil {
 		return nil, err
 	}
 
-	// Convert stored PEM back into RSA private key
+	pemBytes, err := Decrypt(encryptedBytes)
+	if err != nil {
+		return nil, err
+	}
+
 	priv, err := PEMToPrivateKey(pemBytes)
 	if err != nil {
 		return nil, err
@@ -172,8 +199,6 @@ func GetExpiredKey() (*Key, error) {
 	}, nil
 }
 
-// GetAllValidKeys retrieves all unexpired keys from the database.
-// These keys are used to construct the JWKS response.
 func GetAllValidKeys() ([]*Key, error) {
 	now := time.Now().Unix()
 
@@ -192,15 +217,19 @@ func GetAllValidKeys() ([]*Key, error) {
 
 	for rows.Next() {
 		var kid int
-		var pemBytes []byte
+		var encryptedBytes []byte
 		var exp int64
 
-		err := rows.Scan(&kid, &pemBytes, &exp)
+		err := rows.Scan(&kid, &encryptedBytes, &exp)
 		if err != nil {
 			return nil, err
 		}
 
-		// Convert stored PEM back into RSA private key
+		pemBytes, err := Decrypt(encryptedBytes)
+		if err != nil {
+			return nil, err
+		}
+
 		priv, err := PEMToPrivateKey(pemBytes)
 		if err != nil {
 			return nil, err
@@ -215,4 +244,37 @@ func GetAllValidKeys() ([]*Key, error) {
 	}
 
 	return keys, rows.Err()
+}
+
+// CreateUser stores a new registered user
+func CreateUser(username, email, passwordHash string) error {
+	_, err := db.Exec(`
+		INSERT INTO users(username, email, password_hash)
+		VALUES(?, ?, ?)
+	`, username, email, passwordHash)
+
+	return err
+}
+
+// GetUserIDByUsername returns the database id for a username
+func GetUserIDByUsername(username string) (int, error) {
+	var userID int
+
+	err := db.QueryRow(`
+		SELECT id FROM users
+		WHERE username = ?
+	`, username).Scan(&userID)
+
+	return userID, err
+}
+
+// LogAuthRequest stores a successful auth request
+// LogAuthRequest stores a successful auth request.
+func LogAuthRequest(requestIP string, userID *int) error {
+	_, err := db.Exec(`
+		INSERT INTO auth_logs(request_ip, user_id)
+		VALUES(?, ?)
+	`, requestIP, userID)
+
+	return err
 }

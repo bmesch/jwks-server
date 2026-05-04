@@ -16,6 +16,7 @@ func main() {
 	http.HandleFunc("/.well-known/jwks.json", JWKSHandler)
 	http.HandleFunc("/auth", AuthHandler)
 	http.HandleFunc("/auth/", AuthHandler)
+	http.HandleFunc("/register", RegisterHandler)
 
 	port := os.Getenv("PORT")
 	if port == "" {
